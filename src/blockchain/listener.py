@@ -5,6 +5,8 @@ from web3.providers import AsyncHTTPProvider
 from src.utils.logger import get_logger
 from src.db.database import AsyncSessionLocal
 from src.db import models
+from src.utils.redis_client import get_redis
+import json
 
 logger = get_logger(__name__)
 
@@ -129,104 +131,39 @@ async def get_model_fields():
     return []
 
 async def store_block(block_number, block_hash, block_data):
-    """Store block in database with comprehensive error handling."""
     async with AsyncSessionLocal() as session:
         try:
-            # Check if block already exists to avoid duplicates
             existing_block = await session.get(models.BlockHeader, block_number)
             if existing_block:
                 logger.debug("Block already exists", block_number=block_number)
                 return
-            
-            # Get available model fields
+
             model_fields = await get_model_fields()
-            logger.debug(f"Available model fields: {model_fields}")
-            
-            # Convert timestamp to datetime object
             block_timestamp = unix_timestamp_to_datetime(block_data.timestamp)
-            
-            # Start with required fields
+
             block_data_dict = {
                 'block_number': block_number,
-                'timestamp': block_timestamp,
+                'timestamp': block_timestamp.isoformat(),
+                'hash': block_hash.hex() if hasattr(block_hash, 'hex') else str(block_hash),
+                'transaction_count': len(block_data.transactions) if block_data.transactions else 0,
             }
-            
-            # Handle hash field variations
-            hash_value = block_hash.hex() if hasattr(block_hash, 'hex') else str(block_hash)
-            
-            if 'hash' in model_fields:
-                block_data_dict['hash'] = hash_value
-            elif 'block_hash' in model_fields:
-                block_data_dict['block_hash'] = hash_value
-            elif 'block_hash_hex' in model_fields:
-                block_data_dict['block_hash_hex'] = hash_value
-            
-            # Handle parent hash
-            if block_data.parentHash:
-                parent_hash_value = block_data.parentHash.hex()
-                if 'parent_hash' in model_fields:
-                    block_data_dict['parent_hash'] = parent_hash_value
-                elif 'parentHash' in model_fields:
-                    block_data_dict['parentHash'] = parent_hash_value
-            
-            # Handle gas used
-            if block_data.gasUsed is not None:
-                if 'gas_used' in model_fields:
-                    block_data_dict['gas_used'] = int(block_data.gasUsed)
-                elif 'gasUsed' in model_fields:
-                    block_data_dict['gasUsed'] = int(block_data.gasUsed)
-            
-            # Handle gas limit
-            if block_data.gasLimit is not None:
-                if 'gas_limit' in model_fields:
-                    block_data_dict['gas_limit'] = int(block_data.gasLimit)
-                elif 'gasLimit' in model_fields:
-                    block_data_dict['gasLimit'] = int(block_data.gasLimit)
-            
-            # Handle transaction count
-            tx_count = len(block_data.transactions) if block_data.transactions else 0
-            if 'transaction_count' in model_fields:
-                block_data_dict['transaction_count'] = tx_count
-            elif 'tx_count' in model_fields:
-                block_data_dict['tx_count'] = tx_count
-            
-            # Additional common fields
-            if hasattr(block_data, 'difficulty') and block_data.difficulty is not None:
-                if 'difficulty' in model_fields:
-                    block_data_dict['difficulty'] = int(block_data.difficulty)
-            
-            if hasattr(block_data, 'size') and block_data.size is not None:
-                if 'size' in model_fields:
-                    block_data_dict['size'] = int(block_data.size)
-            
-            if hasattr(block_data, 'miner') and block_data.miner:
-                if 'miner' in model_fields:
-                    block_data_dict['miner'] = block_data.miner
-                elif 'coinbase' in model_fields:
-                    block_data_dict['coinbase'] = block_data.miner
-            
-            # Remove any fields that don't exist in the model
+
+            # filter fields
             valid_data = {k: v for k, v in block_data_dict.items() if k in model_fields}
-            
-            if not valid_data:
-                logger.error("No valid fields found for BlockHeader model")
-                return
-            
-            # Create the block object
+
             db_block = models.BlockHeader(**valid_data)
             session.add(db_block)
             await session.commit()
-            
-            logger.info("Block stored in database",
-                       block_number=block_number,
-                       fields_saved=list(valid_data.keys()))
-            
+
+            logger.info("Block stored in database", block_number=block_number)
+
+            # publish to Redis
+            redis = await get_redis()
+            await redis.publish("blocks", json.dumps(valid_data))
+
         except Exception as e:
             await session.rollback()
-            logger.error("Failed to store block",
-                        block_number=block_number,
-                        error=str(e),
-                        model_fields=await get_model_fields())
+            logger.error("Failed to store block", block_number=block_number, error=str(e))
 
 # Health check function to test endpoints
 async def test_endpoints():
